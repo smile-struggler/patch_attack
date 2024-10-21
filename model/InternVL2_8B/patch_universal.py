@@ -141,7 +141,7 @@ with open(target_file, 'r', encoding='utf-8') as file:
             target_list.append(data['target'])
 
 # Take the first 5 and attack
-attack_question_num = 20
+attack_question_num = 50
 attack_question_list = question_list[:attack_question_num]
 attack_target_list = target_list[:attack_question_num]
 attack_image_list = image_list[:attack_question_num]
@@ -188,7 +188,7 @@ attention_mask = model_inputs['attention_mask'].to(model.device)
 num_steps = 300
 eps=0.6
 alpha=16/255
-patch_size = 84
+patch_size = 112
 
 normalized_min = [(0 - m) / s for m, s in zip(IMAGENET_MEAN, IMAGENET_STD)]
 normalized_max = [(1 - m) / s for m, s in zip(IMAGENET_MEAN, IMAGENET_STD)]
@@ -201,6 +201,7 @@ max_values = max_values.view(1, 3, 1, 1)
 
 # 攻击类型列表
 attack_types = ['full', 'top_left', 'center']
+attack_types = ['top_left', 'center']
 
 for attack_type in attack_types:
     print(f'开始攻击方式：{attack_type}')
@@ -216,6 +217,10 @@ for attack_type in attack_types:
         adv_example = torch.zeros((1, 3, patch_size, patch_size),device = model.device, dtype=ori_images.dtype, requires_grad=True)
     else:
         raise ValueError("无效的攻击类型")
+
+    # 假设每个小批次大小为 batch_size_per_step
+    batch_size_per_step = 12
+    num_batches = (batch_size + batch_size_per_step - 1) // batch_size_per_step  # 计算总批次数
 
     # 攻击迭代
     for i in range(num_steps):
@@ -240,64 +245,89 @@ for attack_type in attack_types:
             adv_patch_expanded = adv_example.expand(batch_size, -1, -1, -1)
             adv_images[:, :, x_start:x_start+patch_size, y_start:y_start+patch_size] = adv_patch_expanded
 
-        if adv_images.grad is not None:
-            adv_images.grad.zero_()
-        adv_images.requires_grad_().retain_grad()
+        accumulated_grad = torch.zeros_like(adv_example)
+        total_samples = 0
+
+        for batch_idx in range(num_batches):
+            # 获取当前小批次数据
+            start_idx = batch_idx * batch_size_per_step
+            end_idx = min(start_idx + batch_size_per_step, batch_size)
+            current_batch_size = end_idx - start_idx
+
+            # 如果当前小批次是空的，跳过
+            if current_batch_size == 0:
+                continue
+            
+            temp_adv_images = adv_images[start_idx:end_idx].clone().detach().requires_grad_(True)
+            # 处理当前小批次
+            if temp_adv_images.grad is not None:
+                temp_adv_images.grad.zero_()
+            temp_adv_images.requires_grad_().retain_grad()
         
-        image_flags = torch.ones(images_tensor.shape[0])
-        output_logits = model(
-            pixel_values=adv_images,
-            input_ids=input_ids_list,
-            attention_mask=attention_mask,
-            image_flags=image_flags,
-        ).logits
-        crit = nn.CrossEntropyLoss(reduction='none')
-        loss_list = []
-        for id, suffix_manager in enumerate(suffix_manager_list):
-            loss_slice = slice(suffix_manager._target_slice.start - 1,  suffix_manager._target_slice.stop - 1)
-            valid_output_logits = output_logits[id][attention_mask[id] == 1]
-            valid_input_ids = input_ids_list[id][attention_mask[id] == 1]
-            loss = crit(valid_output_logits[loss_slice,:], valid_input_ids[suffix_manager._target_slice])
-            loss = loss.mean(dim=-1)
-            loss_list.append(loss)
-        stacked_loss = torch.stack(loss_list)
-        loss = stacked_loss.mean()
-        loss.backward()
+            image_flags = torch.ones(current_batch_size)
+            output_logits = model(
+                pixel_values=temp_adv_images,
+                input_ids=input_ids_list[start_idx:end_idx],
+                attention_mask=attention_mask[start_idx:end_idx],
+                image_flags=image_flags,
+            ).logits
+            
+            crit = nn.CrossEntropyLoss(reduction='none')
+            loss_list = []
+            # 只使用对应子批次的suffix_manager
+            for id in range(start_idx, end_idx):
+                suffix_manager = suffix_manager_list[id]
+                loss_slice = slice(suffix_manager._target_slice.start - 1, suffix_manager._target_slice.stop - 1)
+                valid_output_logits = output_logits[id - start_idx][attention_mask[id] == 1]  # 注意索引调整
+                valid_input_ids = input_ids_list[id][attention_mask[id] == 1]
+                loss = crit(valid_output_logits[loss_slice, :], valid_input_ids[suffix_manager._target_slice])
+                loss = loss.mean(dim=-1)
+                loss_list.append(loss)
+            stacked_loss = torch.stack(loss_list)
+            loss = stacked_loss.mean()
+            loss.backward()
 
-        if attack_type == 'full':
-            # 更新 adv_example
-            adv_example = adv_example[0] - alpha * adv_images.grad.mean(dim=0).sign()
-        else:
-            # 只更新补丁区域
-            grad = adv_images.grad  # 获取梯度
-            # 提取补丁区域的梯度
-            grad_patch = grad[:, :, x_start:x_start+patch_size, y_start:y_start+patch_size]
-            # 计算平均梯度
-            adv_example = adv_example[0] - alpha * grad_patch.mean(dim=0).sign()
-
-        adv_example = torch.clamp(adv_example, min=min_values, max=max_values).detach()
-
-        success_num = 0
-        for id, suffix_manager in enumerate(suffix_manager_list):
-            eos_token_id = tokenizer.convert_tokens_to_ids(template.sep)
-            generation_config['eos_token_id'] = eos_token_id
-            valid_input_ids = input_ids_list[id][attention_mask[id] == 1]
-            generation_output = model.generate(
-                pixel_values=adv_example,
-                input_ids=valid_input_ids[:suffix_manager._assistant_role_slice.stop].unsqueeze(0),
-                **generation_config
-            )
-            gen_str  = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
-            if gen_str[:len(attack_target_list[id])] == attack_target_list[id]:
-                is_success=True
+            # 累积梯度并更新样本数
+            if attack_type == 'full':
+                accumulated_grad += temp_adv_images.grad.sum(dim=0)
             else:
-                is_success=False
-            success_num+=is_success
-            print("**********************")
-            print(f"Current Response:\n{gen_str}\n")
-            print("**********************")
+                grad = temp_adv_images.grad
+                grad_patch = grad[:, :, x_start:x_start + patch_size, y_start:y_start + patch_size]
+                accumulated_grad += grad_patch.sum(dim=0)
+            
+            total_samples += current_batch_size
 
-        images_tensor = images_tensor.repeat(attack_question_num, 1, 1, 1)
+        # 计算最终的平均梯度
+        avg_grad = accumulated_grad / total_samples
+
+        # 更新对抗样本或补丁
+        adv_example = adv_example[0] - alpha * avg_grad.sign()
+
+        # 进行范围限制
+        adv_example = torch.clamp(adv_example, min=min_values, max=max_values).detach()
+        
+        success_num = 0
+
+        if i > 290:
+            for id, suffix_manager in enumerate(suffix_manager_list):
+                eos_token_id = tokenizer.convert_tokens_to_ids(template.sep)
+                generation_config['eos_token_id'] = eos_token_id
+                valid_input_ids = input_ids_list[id][attention_mask[id] == 1]
+                generation_output = model.generate(
+                    pixel_values=adv_images[id].unsqueeze(0),
+                    input_ids=valid_input_ids[:suffix_manager._assistant_role_slice.stop].unsqueeze(0),
+                    **generation_config
+                )
+                gen_str  = tokenizer.batch_decode(generation_output, skip_special_tokens=True)[0]
+                if gen_str[:len(attack_target_list[id])] == attack_target_list[id]:
+                    is_success=True
+                else:
+                    is_success=False
+                success_num+=is_success
+                print("**********************")
+                print(f"Current Response:\n{gen_str}\n")
+                print("**********************")
+
         epoch_end_time = time.time()
         epoch_cost_time = round(epoch_end_time - epoch_start_time, 2)
         print(
@@ -313,7 +343,7 @@ for attack_type in attack_types:
         
     norm_mean = torch.tensor(IMAGENET_MEAN)
     norm_std = torch.tensor(IMAGENET_STD)
-    result_image = images_tensor[0].cpu() * norm_std[:,None,None] + norm_mean[:,None,None]
+    result_image = adv_example[0].cpu() * norm_std[:,None,None] + norm_mean[:,None,None]
     result_image = result_image * 255
     result_image = result_image.byte()
     img = Image.fromarray(result_image.permute(1, 2, 0).cpu().numpy(), 'RGB')
