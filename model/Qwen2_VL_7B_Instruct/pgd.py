@@ -16,7 +16,7 @@ from utils.string_utils import autodan_SuffixManager
 from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor
 from qwen_vl_utils import process_vision_info
 from PIL import Image
-torch.autograd.set_detect_anomaly(True)
+import numpy as np
 
 
 image_mean = (
@@ -113,17 +113,22 @@ input_ids_list = inputs['input_ids'].to(model.device)
 attention_mask = inputs['attention_mask'].to(model.device)
 
 num_steps = 2000
-eps=0.6
-alpha=32/255
+eps=32/255
+alpha=8/255
 
 normalized_min = [(0 - m) / s for m, s in zip(image_mean, image_std)]
 normalized_max = [(1 - m) / s for m, s in zip(image_mean, image_std)]
 
+range_values = [max_val - min_val for min_val, max_val in zip(normalized_min, normalized_max)]
+range_tensor = torch.tensor(range_values, device = model.device, dtype = model.dtype).view(1, 3, 1, 1)
+alpha = range_tensor * alpha
+eps = range_tensor * eps
+
 min_values = torch.tensor(normalized_min, device = model.device, dtype = model.dtype)
 max_values = torch.tensor(normalized_max, device = model.device, dtype = model.dtype)
 
-# min_values = min_values.view(1, 3, 1, 1)
-# max_values = max_values.view(1, 3, 1, 1)
+min_values = min_values.view(1, 3, 1, 1)
+max_values = max_values.view(1, 3, 1, 1)
 
 images_tensor = inputs['pixel_values'].to(model.device)
 
@@ -153,18 +158,68 @@ for i in range(num_steps):
     loss = stacked_loss.mean()
     loss.backward()
 
-    mean_grad = images_tensor.grad.view(attack_question_num, 
-                                        images_tensor.shape[0] // attack_question_num, 
-                                        images_tensor.shape[1]).mean(dim=0).sign()
-    adv_images = images_tensor.view(attack_question_num, 
-                                        images_tensor.shape[0] // attack_question_num, 
-                                        images_tensor.shape[1])[0] - alpha * mean_grad
+    # mean_grad = images_tensor.grad.view(attack_question_num, 
+    #                                     images_tensor.shape[0] // attack_question_num, 
+    #                                     images_tensor.shape[1]).mean(dim=0).sign()
+    # adv_images = images_tensor.view(attack_question_num, 
+    #                                     images_tensor.shape[0] // attack_question_num, 
+    #                                     images_tensor.shape[1])[0] - alpha * mean_grad
     
-    channel=3
-    reshaped_patches = adv_images.detach_().reshape(adv_images.shape[0], channel, -1)
-    for c in range(channel):
-        reshaped_patches[:, c, :] = torch.clamp(reshaped_patches[:, c, :], min=min_values[c], max=max_values[c]).detach_()
-    images_tensor = reshaped_patches.reshape(adv_images.shape[0], -1)
+    # channel=3
+    # reshaped_patches = adv_images.detach_().reshape(adv_images.shape[0], channel, -1)
+    # for c in range(channel):
+    #     reshaped_patches[:, c, :] = torch.clamp(reshaped_patches[:, c, :], min=min_values[c], max=max_values[c]).detach_()
+    # images_tensor = reshaped_patches.reshape(adv_images.shape[0], -1)
+
+    temporal_patch_size = processor.image_processor.temporal_patch_size
+    patch_size = processor.image_processor.patch_size
+    merge_size = processor.image_processor.merge_size
+    grid_t, grid_h, grid_w = inputs['image_grid_thw'][0]
+    
+    
+    mean_grad = images_tensor.grad
+    mean_grad = mean_grad.view(attack_question_num, 
+                    mean_grad.shape[0] // attack_question_num, 
+                    mean_grad.shape[1]).reshape(
+        -1, grid_h // merge_size, grid_w // merge_size, 
+        merge_size, merge_size, 3, 
+        temporal_patch_size, patch_size, patch_size
+    )
+    mean_grad = mean_grad.permute(0, 6, 5, 1, 3, 7, 2, 4, 8)
+    mean_grad = mean_grad.reshape(-1, 3, grid_h * patch_size, grid_w * patch_size).mean(dim=0).sign()
+
+    adv_images = images_tensor.view(attack_question_num, 
+                    images_tensor.shape[0] // attack_question_num, 
+                    images_tensor.shape[1]).reshape(
+        -1, grid_h // merge_size, grid_w // merge_size, 
+        merge_size, merge_size, 3, 
+        temporal_patch_size, patch_size, patch_size
+    )
+    adv_images = adv_images.permute(0, 6, 5, 1, 3, 7, 2, 4, 8)
+    adv_images = adv_images.reshape(-1, 3, grid_h * patch_size, grid_w * patch_size)
+    adv_images = adv_images[0] - alpha * mean_grad
+    adv_images = torch.clamp(adv_images, min=min_values, max=max_values).detach()
+
+    if adv_images.shape[0] == 1:
+        adv_images= adv_images.repeat(temporal_patch_size, 1, 1, 1)
+    channel = adv_images.shape[1]
+    grid_t = adv_images.shape[0] // temporal_patch_size
+    grid_h, grid_w = 448 // patch_size, 448 // patch_size
+    adv_images = adv_images.reshape(
+        grid_t,
+        temporal_patch_size,
+        channel,
+        grid_h // merge_size,
+        merge_size,
+        patch_size,
+        grid_w // merge_size,
+        merge_size,
+        patch_size,
+    )
+    adv_images = adv_images.permute(0, 3, 6, 4, 7, 2, 1, 5, 8)
+    images_tensor = adv_images.reshape(
+        grid_t * grid_h * grid_w, channel * temporal_patch_size * patch_size * patch_size
+    )
     
     success_num = 0
     for id, suffix_manager in enumerate(suffix_manager_list):
@@ -176,8 +231,10 @@ for i in range(num_steps):
             pixel_values=images_tensor,
             attention_mask=torch.ones(valid_input_ids.shape[1], device=model.device).unsqueeze(0),
             image_grid_thw=inputs['image_grid_thw'][0].unsqueeze(0),
-            max_new_tokens=64
+            max_new_tokens=64,
+            return_dict_in_generate=True, output_scores=True,do_sample=False
         )
+        import pdb;pdb.set_trace()
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(valid_input_ids, generated_ids)
         ]

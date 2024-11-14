@@ -95,25 +95,26 @@ tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast
 
 # set the max number of tiles in `max_num`
 # pixel_values = load_image('/workshop/crm/checkpoint/InternVL2-8B/examples/image1.jpg', max_num=12).to(torch.bfloat16).cuda()
-generation_config = dict(max_new_tokens=1024, do_sample=True)
+generation_config = dict(max_new_tokens=1024, do_sample=False)
 
 # batch inference, single image per sample (单图批处理)
 # pixel_values1 = load_image('/workshop/crm/checkpoint/InternVL2-8B/examples/image1.jpg', max_num=6).to(torch.bfloat16).cuda()
 # pixel_values2 = load_image('/workshop/crm/checkpoint/InternVL2-8B/examples/image2.jpg', max_num=6).to(torch.bfloat16).cuda()
 # num_patches_list = [pixel_values1.size(0), pixel_values2.size(0)]
 # pixel_values = torch.cat((pixel_values1, pixel_values2), dim=0)
-pixel_values = load_image('/workshop/crm/checkpoint/InternVL2-8B/examples/image1.jpg', max_num=6).to(torch.bfloat16).cuda()
+pixel_values = load_image('/workshop/crm/checkpoint/InternVL2-8B/examples/image1.jpg', max_num=12).to(torch.bfloat16).cuda()
 # pixel_values2 = load_image('/workshop/crm/checkpoint/InternVL2-8B/examples/image2.jpg', max_num=6).to(torch.bfloat16).cuda()
 num_patches_list = [pixel_values.size(0)]
 
-questions = ['<image>\nDescribe the image in detail.'] * len(num_patches_list)
-responses = model.batch_chat(tokenizer, pixel_values,
+questions = ['<image>\nWhat is the content of this image?'] * len(num_patches_list)
+responses = model.batch_chat(tokenizer, None,
                              num_patches_list=num_patches_list,
                              questions=questions,
                              generation_config=generation_config)
 for question, response in zip(questions, responses):
     print(f'User: {question}\nAssistant: {response}')
 
+import pdb;pdb.set_trace()
 IMG_START_TOKEN='<img>'
 IMG_END_TOKEN='</img>'
 IMG_CONTEXT_TOKEN='<IMG_CONTEXT>'
