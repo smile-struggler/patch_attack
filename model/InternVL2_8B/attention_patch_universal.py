@@ -107,7 +107,7 @@ model = AutoModel.from_pretrained(
     path,
     torch_dtype=torch.bfloat16,
     low_cpu_mem_usage=True,
-    use_flash_attn=True,
+    use_flash_attn=False,
     trust_remote_code=True).eval().cuda()
 tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
 
@@ -228,7 +228,7 @@ max_values = max_values.view(1, 3, 1, 1)
 
 # 攻击类型列表
 attack_types = ['full', 'top_left', 'center']
-# attack_types = ['key_pos']
+attack_types = ['top_left']
 
 key_pos_dict = {}
 if 'key_pos' in attack_types:
@@ -255,7 +255,7 @@ for attack_type in attack_types:
 
     # 假设每个小批次大小为 batch_size_per_step
     # batch_size_per_step = 9
-    batch_size_per_step = 8
+    batch_size_per_step = 5
     num_batches = (batch_size + batch_size_per_step - 1) // batch_size_per_step  # 计算总批次数
 
     # 攻击迭代
@@ -309,26 +309,56 @@ for attack_type in attack_types:
             temp_adv_images.requires_grad_().retain_grad()
         
             image_flags = torch.ones(current_batch_size)
-            output_logits = model(
+            output = model(
                 pixel_values=temp_adv_images,
                 input_ids=input_ids_list[start_idx:end_idx],
                 attention_mask=attention_mask[start_idx:end_idx],
+                output_attentions=True,
                 image_flags=image_flags,
-            ).logits
+            )
+
+            output_logits = output['logits']
+            output_attentions = output['attentions'][-1]
+            del output
             
             crit = nn.CrossEntropyLoss(reduction='none')
-            loss_list = []
+            target_loss_list = []
+            img_attn_loss_list = []
+            goal_attn_loss_list = []
             # 只使用对应子批次的suffix_manager
             for id in range(start_idx, end_idx):
                 suffix_manager = suffix_manager_list[id]
                 loss_slice = slice(suffix_manager._target_slice.start - 1, suffix_manager._target_slice.stop - 1)
                 valid_output_logits = output_logits[id - start_idx][attention_mask[id] == 1]  # 注意索引调整
                 valid_input_ids = input_ids_list[id][attention_mask[id] == 1]
-                loss = crit(valid_output_logits[loss_slice, :], valid_input_ids[suffix_manager._target_slice])
-                loss = loss.mean(dim=-1)
-                loss_list.append(loss)
-            stacked_loss = torch.stack(loss_list)
-            loss = stacked_loss.mean()
+                target_loss = crit(valid_output_logits[loss_slice, :], valid_input_ids[suffix_manager._target_slice])
+                target_loss = target_loss.mean(dim=-1)
+                target_loss_list.append(target_loss)
+
+                attn = output_attentions[id - start_idx : id - start_idx + 1, :, suffix_manager._target_slice.start:].mean(2)
+                tmp = attn.mean(1)
+                img_attn = tmp[0, suffix_manager._control_slice.start + 1 : suffix_manager._control_slice.start + model.num_image_token + 1]
+                img_attn_loss_list.append(img_attn)
+
+                goal_attn_loss_list.append(tmp[0, suffix_manager._control_slice.start + model.num_image_token + 2 : suffix_manager._control_slice.stop]) 
+
+            
+            stacked_target_loss = torch.stack(target_loss_list)
+            target_loss = stacked_target_loss.mean()
+
+            stacked_img_attn_loss = torch.cat(img_attn_loss_list)
+            img_attn_loss = stacked_img_attn_loss.mean()
+
+            stacked_goal_attn_loss = torch.cat(goal_attn_loss_list)
+            goal_attn_loss = stacked_goal_attn_loss.mean()
+
+
+            img_attn_weight = 100
+            goal_attn_weight = 50
+
+            attn_loss = - img_attn_weight * img_attn_loss - goal_attn_weight * goal_attn_loss
+            
+            loss = target_loss + attn_loss
             loss.backward()
 
             # images_tensor_grad = torch.abs(temp_adv_images.grad[1]).unsqueeze(0).to(torch.float32)
@@ -419,7 +449,11 @@ for attack_type in attack_types:
             # f"Current Data: {i}/{len(harmful_data.goal[args.start:])}\n"
             f"Current Epoch: {i}/{num_steps}\n"
             f"Passed:{success_num}/{attack_question_num}\n"
-            f"Loss:{loss.item()}\n"
+            f"Target Loss:{target_loss.item()}\n"
+            f"Img Attn Loss:{img_attn_loss.item()}\n"
+            f"Goal Attn Loss:{goal_attn_loss.item()}\n"
+            f"Attn Loss:{attn_loss.item()}\n"
+            f"Total Loss:{loss.item()}\n"
             f"Epoch Cost:{epoch_cost_time}\n"
             # f"Current Suffix:\n{best_new_adv_suffix}\n"
             
@@ -431,5 +465,5 @@ for attack_type in attack_types:
     result_image = result_image * 255
     result_image = result_image.byte()
     img = Image.fromarray(result_image.permute(1, 2, 0).cpu().numpy(), 'RGB')
-    img.save(f'../../images/patch_noise_image/internvl2_patch_{attack_type}.png')
+    img.save(f'../../images/patch_noise_image/internvl2_patch_img{img_attn_weight}_goal{goal_attn_weight}_{attack_type}.png')
 print('所有攻击已完成。')
