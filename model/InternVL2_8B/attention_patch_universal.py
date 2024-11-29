@@ -104,6 +104,44 @@ def load_image(image_file, input_size=448, max_num=12, resize_shape = None):
     pixel_values = torch.stack(pixel_values).to(torch.bfloat16).cuda()
     return pixel_values
 
+def _map_subwords_to_words(sentence: str):
+    """
+    Convert a sentence into tokens and map subword tokens to their corresponding words.
+
+    Parameters:
+    - sentence (str): The input sentence.
+
+    Returns:
+    - mapping (list): List mapping subword tokens to word indices.
+    - tokens (list): Tokenized version of the input sentence.
+    """
+    tokens = tokenizer.tokenize(sentence)
+    mapping = []
+    word_idx = 0
+    for token in tokens:
+        if token.startswith("▁"):
+            mapping.append(word_idx)
+            word_idx += 1
+        else:
+            mapping.append(word_idx - 1)
+    return mapping, tokens
+
+def _normalize_importance(word_importance):
+    """
+    Normalize importance values of words in a sentence using min-max scaling.
+
+    Parameters:
+    - word_importance (list): List of importance values for each word.
+
+    Returns:
+    - list: Normalized importance values for each word.
+    """
+    min_importance = np.min(word_importance)
+    max_importance = np.max(word_importance)
+    # min_importance = torch.min(word_importance)
+    # max_importance = torch.max(word_importance)
+    return (word_importance - min_importance) / (max_importance - min_importance)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='test')
 
@@ -151,7 +189,7 @@ if __name__ == "__main__":
         use_flash_attn=False,
         trust_remote_code=True).eval().cuda()
     tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
-
+    model.eval()
     # set the max number of tiles in `max_num`
     # pixel_values = load_image('/workshop/crm/checkpoint/InternVL2-8B/examples/image1.jpg', max_num=12).to(torch.bfloat16).cuda()
     generation_config = dict(max_new_tokens=64, do_sample=True)
@@ -377,11 +415,53 @@ if __name__ == "__main__":
                 if temp_adv_images.grad is not None:
                     temp_adv_images.grad.zero_()
                 temp_adv_images.requires_grad_().retain_grad()
-            
+
+                embeddings = model.get_input_embeddings()(input_ids_list[start_idx:end_idx])
+                embeddings.requires_grad_()
+                embeddings.retain_grad()
+
                 image_flags = torch.ones(current_batch_size)
                 output = model(
                     pixel_values=temp_adv_images,
                     input_ids=input_ids_list[start_idx:end_idx],
+                    input_embeds=embeddings,
+                    attention_mask=attention_mask[start_idx:end_idx],
+                    output_attentions=True,
+                    image_flags=image_flags,
+                )
+
+                output_logits = output['logits']
+                output_attentions = output['attentions'][-1]
+                del output
+                
+                crit = nn.CrossEntropyLoss(reduction='none')
+                loss_list = []
+
+                # 只使用对应子批次的suffix_manager
+                for id in range(start_idx, end_idx):
+                    suffix_manager = suffix_manager_list[id]
+                    loss_slice = slice(suffix_manager._target_slice.start - 1, suffix_manager._target_slice.stop - 1)
+                    valid_output_logits = output_logits[id - start_idx][attention_mask[id] == 1]  # 注意索引调整
+                    valid_input_ids = input_ids_list[id][attention_mask[id] == 1]
+                    target_loss = crit(valid_output_logits[loss_slice, :], valid_input_ids[suffix_manager._target_slice])
+                    target_loss = target_loss.mean(dim=-1)
+                    loss_list.append(target_loss)
+
+                stacked_loss = torch.stack(loss_list)
+                loss = stacked_loss.mean()
+                loss.backward()
+
+                if temp_adv_images.grad is not None:
+                    temp_adv_images.grad.zero_()
+                temp_adv_images.requires_grad_().retain_grad()
+
+                grads = embeddings.grad
+
+                image_flags = torch.ones(current_batch_size)
+                output = model(
+                    pixel_values=temp_adv_images,
+                    input_ids=input_ids_list[start_idx:end_idx],
+                    # input_embeds=embeddings,
                     attention_mask=attention_mask[start_idx:end_idx],
                     output_attentions=True,
                     image_flags=image_flags,
@@ -405,6 +485,10 @@ if __name__ == "__main__":
                 cross_attn_loss_list = []
 
                 sys_attn_loss_list = []
+
+                grad_attn_loss = 0
+
+                grads = embeddings.grad
 
                 # 只使用对应子批次的suffix_manager
                 for id in range(start_idx, end_idx):
@@ -440,6 +524,20 @@ if __name__ == "__main__":
                     cross_tmp = cross.mean(1)
 
                     cross_attn_loss_list.append(cross_tmp[0, suffix_manager._control_slice.start + 1 : suffix_manager._control_slice.start + model.num_image_token + 1]) 
+
+                    mapping, tokens = _map_subwords_to_words(prompt_list[id])
+                    words = "".join(tokens).replace("▁", " ").split()
+                    
+                    word_grads = [torch.zeros_like(grads[id - start_idx][0]) for _ in range(len(words))]  # Initialize gradient vectors for each word
+
+                    for idx, grad in enumerate(grads[id - start_idx][:len(mapping)]):
+                        word_grads[mapping[idx]] += grad
+                    
+                    words_importance = [grad.norm().item() for grad in word_grads]
+                    normalized_importance = _normalize_importance(words_importance)
+
+                    ans = dict(zip(words, normalized_importance))
+                    grad_attn_loss += ans[image_tokens]
 
                 stacked_target_loss = torch.stack(target_loss_list)
                 target_loss = stacked_target_loss.mean()
@@ -481,6 +579,7 @@ if __name__ == "__main__":
                         img_attn_weight = 0
                         total_img_attn_loss = 0
 
+                total_img_attn_loss = grad_attn_loss / batch_size
                 # attn_loss =  - adv_attn_weight * adv_attn_loss - img_attn_weight * img_attn_loss - goal_attn_weight * goal_attn_loss
                 
                 loss = target_weight * target_loss \
@@ -588,6 +687,7 @@ if __name__ == "__main__":
                 f"Target Loss:{target_loss.item()}\n"
                 f"Adv Attn Loss:{adv_attn_loss.item()}\n"
                 f"Img Attn Loss:{img_attn_loss.item()}\n"
+                f"Total Img Attn Loss:{total_img_attn_loss.item()}\n"
                 f"Goal Attn Loss:{goal_attn_loss.item()}\n"
                 f"Sys Attn Loss:{sys_attn_loss.item()}\n"
                 # f"Attn Loss:{attn_loss.item()}\n"
