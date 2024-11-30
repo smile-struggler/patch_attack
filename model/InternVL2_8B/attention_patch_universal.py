@@ -171,6 +171,9 @@ if __name__ == "__main__":
     parser.add_argument('--sys_attn_weight', 
                         default=0, type=int)
     
+    parser.add_argument('--attn_entropy_weight', 
+                        default=0, type=float)
+    
     parser.add_argument('--attn_limit', 
                         default=False, type=bool)
     
@@ -426,12 +429,12 @@ if __name__ == "__main__":
                     input_ids=input_ids_list[start_idx:end_idx],
                     input_embeds=embeddings,
                     attention_mask=attention_mask[start_idx:end_idx],
-                    output_attentions=True,
+                    # output_attentions=True,
                     image_flags=image_flags,
                 )
 
                 output_logits = output['logits']
-                output_attentions = output['attentions'][-1]
+                # output_attentions = output['attentions'][-1]
                 del output
                 
                 crit = nn.CrossEntropyLoss(reduction='none')
@@ -463,30 +466,32 @@ if __name__ == "__main__":
                     input_ids=input_ids_list[start_idx:end_idx],
                     # input_embeds=embeddings,
                     attention_mask=attention_mask[start_idx:end_idx],
-                    output_attentions=True,
+                    # output_attentions=True, 
                     image_flags=image_flags,
                 )
 
                 output_logits = output['logits']
-                output_attentions = output['attentions'][-1]
+                # output_attentions = output['attentions'][-1]
                 del output
                 
                 crit = nn.CrossEntropyLoss(reduction='none')
                 target_loss_list = []
-                # 扰动的loss
-                adv_attn_loss_list = []
-                # 图像内容的loss
-                img_attn_loss_list = []
+                # # 扰动的loss
+                # adv_attn_loss_list = []
+                # # 图像内容的loss
+                # img_attn_loss_list = []
                 # 整张图的loss
                 total_img_attn_loss_list = []
 
-                goal_attn_loss_list = []
+                # goal_attn_loss_list = []
 
-                cross_attn_loss_list = []
+                # cross_attn_loss_list = []
 
-                sys_attn_loss_list = []
+                # sys_attn_loss_list = []
 
                 grad_attn_loss = 0
+
+                attn_entropy_loss = 0
 
                 grads = embeddings.grad
 
@@ -500,30 +505,30 @@ if __name__ == "__main__":
                     target_loss = target_loss.mean(dim=-1)
                     target_loss_list.append(target_loss)
 
-                    attn = output_attentions[id - start_idx : id - start_idx + 1, :, suffix_manager._target_slice.start:].mean(2)
-                    tmp = attn.mean(1)
-                    total_attn = tmp[0, suffix_manager._control_slice.start + 1 : suffix_manager._control_slice.start + model.num_image_token + 1]
-                    total_img_attn_loss_list.append(total_attn)
+                    # attn = output_attentions[id - start_idx : id - start_idx + 1, :, suffix_manager._target_slice.start:].mean(2)
+                    # tmp = attn.mean(1)
+                    # total_attn = tmp[0, suffix_manager._control_slice.start + 1 : suffix_manager._control_slice.start + model.num_image_token + 1]
+                    # total_img_attn_loss_list.append(total_attn)
 
-                    goal_attn_loss_list.append(tmp[0, suffix_manager._control_slice.start + model.num_image_token + 2 : suffix_manager._control_slice.stop]) 
+                    # goal_attn_loss_list.append(tmp[0, suffix_manager._control_slice.start + model.num_image_token + 2 : suffix_manager._control_slice.stop]) 
 
-                    sys_attn_loss_list.append(tmp[0, : suffix_manager._user_role_slice.start]) 
+                    # sys_attn_loss_list.append(tmp[0, : suffix_manager._user_role_slice.start]) 
 
-                    side_len = int(math.sqrt(model.num_image_token))
+                    # side_len = int(math.sqrt(model.num_image_token))
                     
-                    # 将tensor重塑为n*n的矩阵
-                    attn_matrix = total_attn.view(side_len, side_len)
+                    # # 将tensor重塑为n*n的矩阵
+                    # attn_matrix = total_attn.view(side_len, side_len)
 
-                    # 计算靠右的列数
-                    right_cols = math.ceil((448 - int(1024 / 1294 * 448)) / 448 * side_len)
+                    # # 计算靠右的列数
+                    # right_cols = math.ceil((448 - int(1024 / 1294 * 448)) / 448 * side_len)
 
-                    adv_attn_loss_list.append(attn_matrix[:, -right_cols:].flatten()) 
-                    img_attn_loss_list.append(attn_matrix[:, :-right_cols].flatten()) 
+                    # adv_attn_loss_list.append(attn_matrix[:, -right_cols:].flatten()) 
+                    # img_attn_loss_list.append(attn_matrix[:, :-right_cols].flatten()) 
 
-                    cross = output_attentions[id - start_idx : id - start_idx + 1, :, suffix_manager._control_slice.start + model.num_image_token + 1 : suffix_manager._control_slice.stop].mean(2)
-                    cross_tmp = cross.mean(1)
+                    # cross = output_attentions[id - start_idx : id - start_idx + 1, :, suffix_manager._control_slice.start + model.num_image_token + 1 : suffix_manager._control_slice.stop].mean(2)
+                    # cross_tmp = cross.mean(1)
 
-                    cross_attn_loss_list.append(cross_tmp[0, suffix_manager._control_slice.start + 1 : suffix_manager._control_slice.start + model.num_image_token + 1]) 
+                    # cross_attn_loss_list.append(cross_tmp[0, suffix_manager._control_slice.start + 1 : suffix_manager._control_slice.start + model.num_image_token + 1]) 
 
                     mapping, tokens = _map_subwords_to_words(prompt_list[id])
                     words = "".join(tokens).replace("▁", " ").split()
@@ -539,26 +544,29 @@ if __name__ == "__main__":
                     ans = dict(zip(words, normalized_importance))
                     grad_attn_loss += ans[image_tokens]
 
+                    input_normalized_importance = np.clip(normalized_importance[:suffix_manager._control_slice.stop], 1e-15, 1 - 1e-15)
+                    attn_entropy_loss += -np.sum(input_normalized_importance * np.log(input_normalized_importance))
+
                 stacked_target_loss = torch.stack(target_loss_list)
                 target_loss = stacked_target_loss.mean()
 
-                stacked_adv_attn_loss = torch.cat(adv_attn_loss_list)
-                adv_attn_loss = stacked_adv_attn_loss.mean()
+                # stacked_adv_attn_loss = torch.cat(adv_attn_loss_list)
+                # adv_attn_loss = stacked_adv_attn_loss.mean()
 
-                stacked_img_attn_loss = torch.cat(img_attn_loss_list)
-                img_attn_loss = stacked_img_attn_loss.mean()
+                # stacked_img_attn_loss = torch.cat(img_attn_loss_list)
+                # img_attn_loss = stacked_img_attn_loss.mean()
 
-                stacked_total_img_attn_loss = torch.cat(total_img_attn_loss_list)
-                total_img_attn_loss = stacked_total_img_attn_loss.mean()
+                # stacked_total_img_attn_loss = torch.cat(total_img_attn_loss_list)
+                # total_img_attn_loss = stacked_total_img_attn_loss.mean()
                 
-                stacked_goal_attn_loss = torch.cat(goal_attn_loss_list)
-                goal_attn_loss = stacked_goal_attn_loss.mean()
+                # stacked_goal_attn_loss = torch.cat(goal_attn_loss_list)
+                # goal_attn_loss = stacked_goal_attn_loss.mean()
 
-                stacked_cross_attn_loss = torch.cat(cross_attn_loss_list)
-                cross_attn_loss = stacked_cross_attn_loss.mean()
+                # stacked_cross_attn_loss = torch.cat(cross_attn_loss_list)
+                # cross_attn_loss = stacked_cross_attn_loss.mean()
 
-                stacked_sys_attn_loss = torch.cat(sys_attn_loss_list)
-                sys_attn_loss = stacked_sys_attn_loss.mean()
+                # stacked_sys_attn_loss = torch.cat(sys_attn_loss_list)
+                # sys_attn_loss = stacked_sys_attn_loss.mean()
 
                 
 
@@ -566,29 +574,32 @@ if __name__ == "__main__":
                 # goal_attn_loss = stacked_goal_attn_loss.mean()
                 
                 target_weight = 1
-                adv_attn_weight = args.adv_attn_weight
-                img_attn_weight = args.img_attn_weight
+                # adv_attn_weight = args.adv_attn_weight
+                # img_attn_weight = args.img_attn_weight
                 total_img_attn_weight = args.total_img_attn_weight
-                cross_attn_weight = args.cross_attn_weight
-                goal_attn_weight = args.goal_attn_weight
-                sys_attn_weight = args.sys_attn_weight
+                attn_entropy_weight = args.attn_entropy_weight
+                # cross_attn_weight = args.cross_attn_weight
+                # goal_attn_weight = args.goal_attn_weight
+                # sys_attn_weight = args.sys_attn_weight
 
-                if args.attn_limit is True:
-                    if adv_attn_loss + img_attn_loss > 0.0020:
-                        adv_attn_weight = 0
-                        img_attn_weight = 0
-                        total_img_attn_loss = 0
+                # if args.attn_limit is True:
+                #     if adv_attn_loss + img_attn_loss > 0.0020:
+                #         adv_attn_weight = 0
+                #         img_attn_weight = 0
+                #         total_img_attn_loss = 0
 
                 total_img_attn_loss = grad_attn_loss / batch_size
+                attn_entropy_loss = attn_entropy_loss / batch_size
                 # attn_loss =  - adv_attn_weight * adv_attn_loss - img_attn_weight * img_attn_loss - goal_attn_weight * goal_attn_loss
                 
                 loss = target_weight * target_loss \
-                    - adv_attn_weight * adv_attn_loss \
-                    - img_attn_weight * img_attn_loss \
                     - total_img_attn_weight * total_img_attn_loss \
-                    - cross_attn_weight * cross_attn_loss \
-                    - goal_attn_weight * goal_attn_loss \
-                    - sys_attn_weight * sys_attn_loss
+                    - attn_entropy_weight * attn_entropy_loss
+                    # - adv_attn_weight * adv_attn_loss \
+                    # - img_attn_weight * img_attn_loss \
+                    # - cross_attn_weight * cross_attn_loss \
+                    # - goal_attn_weight * goal_attn_loss \
+                    # - sys_attn_weight * sys_attn_loss
                 
                 loss.backward()
                 # images_tensor_grad = torch.abs(temp_adv_images.grad[1]).unsqueeze(0).to(torch.float32)
@@ -685,11 +696,12 @@ if __name__ == "__main__":
                 f"Current Epoch: {i}/{num_steps}\n"
                 f"Passed:{success_num}/{attack_question_num}\n"
                 f"Target Loss:{target_loss.item()}\n"
-                f"Adv Attn Loss:{adv_attn_loss.item()}\n"
-                f"Img Attn Loss:{img_attn_loss.item()}\n"
+                # f"Adv Attn Loss:{adv_attn_loss.item()}\n"
+                # f"Img Attn Loss:{img_attn_loss.item()}\n"
                 f"Total Img Attn Loss:{total_img_attn_loss.item()}\n"
-                f"Goal Attn Loss:{goal_attn_loss.item()}\n"
-                f"Sys Attn Loss:{sys_attn_loss.item()}\n"
+                f"Attn Entropy Loss Loss:{attn_entropy_loss.item()}\n"
+                # f"Goal Attn Loss:{goal_attn_loss.item()}\n"
+                # f"Sys Attn Loss:{sys_attn_loss.item()}\n"
                 # f"Attn Loss:{attn_loss.item()}\n"
                 f"Total Loss:{loss.item()}\n"
                 f"Epoch Cost:{epoch_cost_time}\n"
@@ -703,5 +715,6 @@ if __name__ == "__main__":
         result_image = result_image * 255
         result_image = result_image.byte()
         img = Image.fromarray(result_image.permute(1, 2, 0).cpu().numpy(), 'RGB')
-        img.save(os.path.join(args.result_path, f'internvl2_patch_total{total_img_attn_weight}_adv{adv_attn_weight}_img{img_attn_weight}_cross{cross_attn_weight}_goal{goal_attn_weight}_sys{sys_attn_weight}_{attack_type}_{args.annotation}.png'))
+        img.save(os.path.join(args.result_path, f'internvl2_patch_total{total_img_attn_weight}_entropy{attn_entropy_weight}_{attack_type}_{args.annotation}.png'))
+        # img.save(os.path.join(args.result_path, f'internvl2_patch_total{total_img_attn_weight}_adv{adv_attn_weight}_img{img_attn_weight}_cross{cross_attn_weight}_goal{goal_attn_weight}_sys{sys_attn_weight}_{attack_type}_{args.annotation}.png'))
     print('所有攻击已完成。')
