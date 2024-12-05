@@ -362,7 +362,7 @@ if __name__ == "__main__":
 
         # 假设每个小批次大小为 batch_size_per_step
         # batch_size_per_step = 9
-        batch_size_per_step = 4
+        batch_size_per_step = 3
         num_batches = (batch_size + batch_size_per_step - 1) // batch_size_per_step  # 计算总批次数
 
         # 攻击迭代
@@ -432,8 +432,17 @@ if __name__ == "__main__":
                 )
 
                 output_logits = output['logits']
-                output_attentions = output['attentions'][len(output.attentions)//2]
-                del output
+                attentions = output['attentions']
+
+                middle_layers = attentions[15:23]
+
+                selected_heads = [layer[:, :2, :, :] for layer in middle_layers]
+
+                stacked_attention = torch.stack(selected_heads, dim=0)
+
+                output_attentions = stacked_attention.mean(dim=0)
+
+                del output,attentions,middle_layers
                 
                 crit = nn.CrossEntropyLoss(reduction='none')
                 target_loss_list = []
@@ -460,7 +469,7 @@ if __name__ == "__main__":
                     target_loss = target_loss.mean(dim=-1)
                     target_loss_list.append(target_loss)
 
-                    attn = output_attentions[id - start_idx : id - start_idx + 1, :, suffix_manager._target_slice.start:].mean(2)
+                    attn = output_attentions[id - start_idx : id - start_idx + 1, :, suffix_manager._control_slice.start + model.num_image_token + 2 : suffix_manager._control_slice.stop, :].mean(2)
                     tmp = attn.mean(1)
                     total_attn = tmp[0, suffix_manager._control_slice.start + 1 : suffix_manager._control_slice.start + model.num_image_token + 1]
                     total_img_attn_loss_list.append(total_attn)
