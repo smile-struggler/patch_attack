@@ -1,5 +1,16 @@
 import torch
 from qwen_vl_utils import process_vision_info
+import sys
+import os
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+model_path = os.path.join(current_dir, "../model/LLaVA-NeXT")
+sys.path.append(os.path.abspath(model_path))
+
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN, IGNORE_INDEX
+
+
+from llava.mm_utils import get_model_name_from_path, process_images, tokenizer_image_token
 
 import re
 
@@ -12,7 +23,7 @@ class autodan_SuffixManager:
         self.target = target
         self.adv_string = adv_string
 
-    def get_prompt(self, adv_string=None, image=None):
+    def get_prompt(self, adv_string=None, image=None, model_name = None):
         
         if self.conv_template is not None:
             if adv_string is not None:
@@ -25,15 +36,16 @@ class autodan_SuffixManager:
             self.conv_template.append_message(self.conv_template.roles[1], f"{self.target}")
             prompt = self.conv_template.get_prompt()
 
-            encoding = self.tokenizer(prompt)
-            toks = encoding.input_ids
+            # encoding = self.tokenizer(prompt)
+            # toks = encoding.input_ids
 
-            if self.conv_template.name=='internlm2-chat':
+            if hasattr(self.conv_template, 'name') and self.conv_template.name=='internlm2-chat':
                 self.conv_template.messages = []
+                sys_stop_pos = len(self.tokenizer(self.conv_template.get_prompt()).input_ids)
 
                 self.conv_template.append_message(self.conv_template.roles[0], None)
                 toks = self.tokenizer(self.conv_template.get_prompt()).input_ids
-                self._user_role_slice = slice(None, len(toks))
+                self._user_role_slice = slice(sys_stop_pos, len(toks))
 
                 # update last message
                 self.conv_template.messages[-1][1] = f"{self.adv_string}"
@@ -53,9 +65,58 @@ class autodan_SuffixManager:
                 self._target_slice = slice(self._assistant_role_slice.stop, len(toks) - 1)
                 self._loss_slice = slice(self._assistant_role_slice.stop - 1, len(toks) - 2)
 
+            elif self.conv_template.version=='llama_v3':
+                eot_ids = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
+
+                self.conv_template.messages = []
+
+                self.conv_template.append_message(self.conv_template.roles[0], None)
+                toks = (
+                    tokenizer_image_token(self.conv_template.get_prompt(), self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+                    # .unsqueeze(0)
+                    # .cuda()
+                )
+ 
+                self._user_role_slice = slice(None, len(toks))
+
+                # update last message
+                self.conv_template.messages[-1][1] = f"{self.adv_string}"
+                toks = (
+                    tokenizer_image_token(self.conv_template.get_prompt(), self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+                    # .unsqueeze(0)
+                    # .cuda()
+                )
+                goal_end_indices = torch.nonzero(toks[self._user_role_slice.stop:]== eot_ids)[0].item()
+                self._goal_slice = slice(self._user_role_slice.stop, max(self._user_role_slice.stop, self._user_role_slice.stop + goal_end_indices))
+                self._control_slice = self._goal_slice
+
+                self.conv_template.append_message(self.conv_template.roles[1], None)
+                toks = (
+                    tokenizer_image_token(self.conv_template.get_prompt(), self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+                    # .unsqueeze(0)
+                    # .cuda()
+                )
+                self._assistant_role_slice = slice(self._control_slice.stop + 1, len(toks))
+
+                # update last message
+                self.conv_template.messages[-1][1] = f"{self.target}"
+                toks = (
+                    tokenizer_image_token(self.conv_template.get_prompt(), self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+                    # .unsqueeze(0)
+                    # .cuda()
+                )
+
+                toks = torch.cat((toks[:self._assistant_role_slice.stop], torch.tensor([198],device=toks.device), toks[self._assistant_role_slice.stop:]))
+
+                target_end_indices = torch.nonzero(toks[self._assistant_role_slice.stop:]== eot_ids)[0].item()
+                self._target_slice = slice(self._assistant_role_slice.stop, self._assistant_role_slice.stop + target_end_indices)
+                self._loss_slice = slice(self._assistant_role_slice.stop - 1, self._assistant_role_slice.stop + target_end_indices - 1)
+            
             self.conv_template.messages = []
         else:
+            
             if self.tokenizer.__class__.__name__=='Qwen2VLProcessor':
+                eos_ids = self.tokenizer.tokenizer.eos_token_id
                 messages = []
                 messages.append({
                     "role": "user",
@@ -87,9 +148,10 @@ class autodan_SuffixManager:
                 ]
         
                 toks = self.qwen_tokenizer(messages=messages, with_content=True)
-                self._target_slice = slice(self._assistant_role_slice.stop, len(toks) - 1)
-                self._loss_slice = slice(self._assistant_role_slice.stop - 1, len(toks) - 2)
-
+                target_end_indices = torch.nonzero(toks[self._assistant_role_slice.stop:]== eos_ids)[0].item()
+                self._target_slice = slice(self._assistant_role_slice.stop, self._assistant_role_slice.stop + target_end_indices)
+                self._loss_slice = slice(self._assistant_role_slice.stop - 1, self._assistant_role_slice.stop + target_end_indices - 1)
+                
                 prompt = messages
         return prompt
 
@@ -114,6 +176,17 @@ class autodan_SuffixManager:
         input_ids = toks[:self._target_slice.stop]
         return input_ids, prompt
 
+    def get_llava_image_input_ids(self, adv_string=None):
+        prompt = self.get_prompt(adv_string=adv_string)
+        toks = (
+            tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors="pt")
+            # .unsqueeze(0)
+            .cuda()
+        )
+        toks = torch.cat((toks[:self._assistant_role_slice.stop], torch.tensor([198],device=toks.device), toks[self._assistant_role_slice.stop:]))
+        input_ids = toks[:self._target_slice.stop]
+
+        return input_ids
 
     def qwen_tokenizer(self,messages, with_content=True):
         text = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
